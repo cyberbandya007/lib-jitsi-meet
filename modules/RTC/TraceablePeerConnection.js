@@ -214,20 +214,6 @@ export default function TraceablePeerConnection(
             this.onicecandidate(event);
         }
     };
-    this.onaddstream = null;
-    this.peerconnection.onaddstream = event => {
-        this.trace('onaddstream', event.stream.id);
-        if (this.onaddstream !== null) {
-            this.onaddstream(event);
-        }
-    };
-    this.onremovestream = null;
-    this.peerconnection.onremovestream = event => {
-        this.trace('onremovestream', event.stream.id);
-        if (this.onremovestream !== null) {
-            this.onremovestream(event);
-        }
-    };
     this.peerconnection.onaddstream
         = event => this._remoteStreamAdded(event.stream);
     this.peerconnection.onremovestream
@@ -471,6 +457,30 @@ TraceablePeerConnection.prototype.getRemoteTracks
     }
 
     return remoteTracks;
+};
+
+/**
+ * Tries to find {@link JitsiTrack} for given SSRC number. It will search both
+ * local and remote tracks bound to this instance.
+ * @param {number} ssrc
+ * @return {JitsiTrack|null}
+ */
+TraceablePeerConnection.prototype.getTrackBySSRC = function(ssrc) {
+    if (typeof ssrc !== 'number') {
+        throw new Error(`SSRC ${ssrc} is not a number`);
+    }
+    for (const localTrack of this.localTracks.values()) {
+        if (this.getLocalSSRC(localTrack) === ssrc) {
+            return localTrack;
+        }
+    }
+    for (const remoteTrack of this.getRemoteTracks()) {
+        if (remoteTrack.getSSRC() === ssrc) {
+            return remoteTrack;
+        }
+    }
+
+    return null;
 };
 
 /**
