@@ -6,7 +6,6 @@ import ConnectionQuality from './modules/connectivity/ConnectionQuality';
 import { getLogger } from 'jitsi-meet-logger';
 import GlobalOnErrorHandler from './modules/util/GlobalOnErrorHandler';
 import EventEmitter from 'events';
-import * as JingleSessionState from './modules/xmpp/JingleSessionState';
 import * as JitsiConferenceErrors from './JitsiConferenceErrors';
 import JitsiConferenceEventManager from './JitsiConferenceEventManager';
 import * as JitsiConferenceEvents from './JitsiConferenceEvents';
@@ -15,6 +14,7 @@ import JitsiParticipant from './JitsiParticipant';
 import JitsiTrackError from './JitsiTrackError';
 import * as JitsiTrackErrors from './JitsiTrackErrors';
 import * as JitsiTrackEvents from './JitsiTrackEvents';
+import Jvb121EventGenerator from './modules/event/Jvb121EventGenerator';
 import * as MediaType from './service/RTC/MediaType';
 import ParticipantConnectionStatusHandler
     from './modules/connectivity/ParticipantConnectionStatus';
@@ -45,17 +45,25 @@ const logger = getLogger(__filename);
  * @param {number} [options.config.avgRtpStatsN=15] how many samples are to be
  * collected by {@link AvgRTPStatsReporter}, before arithmetic mean is
  * calculated and submitted to the analytics module.
- * @param {boolean} [options.config.enableP2P] when set to <tt>true</tt>
+ * @param {boolean} [options.config.p2p.enabled] when set to <tt>true</tt>
  * the peer to peer mode will be enabled. It means that when there are only 2
  * participants in the conference an attempt to make direct connection will be
  * made. If the connection succeeds the conference will stop sending data
  * through the JVB connection and will use the direct one instead.
- * @param {number} [options.config.backToP2PDelay=5] a delay given in seconds,
- * before the conference switches back to P2P, after the 3rd participant has
- * left the room.
+ * @param {number} [options.config.p2p.backToP2PDelay=5] a delay given in
+ * seconds, before the conference switches back to P2P, after the 3rd
+ * participant has left the room.
  * @param {number} [options.config.channelLastN=-1] The requested amount of
  * videos are going to be delivered after the value is in effect. Set to -1 for
  * unlimited or all available videos.
+ * @param {number} [options.config.forceJVB121Ratio]
+ * "Math.random() < forceJVB121Ratio" will determine whether a 2 people
+ * conference should be moved to the JVB instead of P2P. The decision is made on
+ * the responder side, after ICE succeeds on the P2P connection.
+ * @param {*} [options.config.openBridgeChannel] Which kind of communication to
+ * open with the videobridge. Values can be "datachannel", "websocket", true
+ * (treat it as "datachannel"), undefined (treat it as "datachannel") and false
+ * (don't open any channel).
  * @constructor
  *
  * FIXME Make all methods which are called from lib-internal classes
@@ -143,7 +151,8 @@ export default function JitsiConference(options) {
      */
     this.deferredStartP2PTask = null;
 
-    const delay = parseInt(options.config.backToP2PDelay, 10);
+    const delay
+        = parseInt(options.config.p2p && options.config.p2p.backToP2PDelay, 10);
 
     /**
      * A delay given in seconds, before the conference switches back to P2P
@@ -266,6 +275,12 @@ JitsiConference.prototype._init = function(options = {}) {
         this.setLastN(options.config.channelLastN);
     }
 
+    /**
+     * Emits {@link JitsiConferenceEvents.JVB121_STATUS}.
+     * @type {Jvb121EventGenerator}
+     */
+    this.jvb121Status = new Jvb121EventGenerator(this);
+
     // creates dominant speaker detection that works only in p2p mode
     this.p2pDominantSpeakerDetection = new P2PDominantSpeakerDetection(this);
 };
@@ -303,7 +318,7 @@ JitsiConference.prototype.leave = function() {
 
     this.getLocalTracks().forEach(track => this.onLocalTrackRemoved(track));
 
-    this.rtc.closeAllDataChannels();
+    this.rtc.closeBridgeChannel();
     if (this.statistics) {
         this.statistics.dispose();
     }
@@ -616,11 +631,11 @@ JitsiConference.prototype.addTrack = function(track) {
 
 /**
  * Fires TRACK_AUDIO_LEVEL_CHANGED change conference event (for local tracks).
- * @param {TraceablePeerConnection|null} tpc
- * @param audioLevel the audio level
+ * @param {number} audioLevel the audio level
+ * @param {TraceablePeerConnection} [tpc]
  */
 JitsiConference.prototype._fireAudioLevelChangeEvent
-= function(tpc, audioLevel) {
+= function(audioLevel, tpc) {
     const activeTpc = this.getActivePeerConnection();
 
     // There will be no TraceablePeerConnection if audio levels do not come from
@@ -628,7 +643,7 @@ JitsiConference.prototype._fireAudioLevelChangeEvent
     // Audio Analyser API and emits local audio levels events through
     // JitsiTrack.setAudioLevel, but does not provide TPC instance which is
     // optional.
-    if (tpc === null || activeTpc === tpc) {
+    if (!tpc || activeTpc === tpc) {
         this.eventEmitter.emit(
             JitsiConferenceEvents.TRACK_AUDIO_LEVEL_CHANGED,
             this.myUserId(), audioLevel);
@@ -954,6 +969,20 @@ JitsiConference.prototype.setLastN = function(lastN) {
         throw new RangeError('lastN cannot be smaller than -1');
     }
     this.rtc.setLastN(n);
+
+    // If the P2P session is not fully established yet, we wait until it gets
+    // established.
+    if (this.p2pJingleSession) {
+        const isVideoActive = n !== 0;
+
+        this.p2pJingleSession
+            .setMediaTransferActive(true, isVideoActive)
+            .catch(error => {
+                logger.error(
+                    `Failed to adjust video transfer status (${isVideoActive})`,
+                    error);
+            });
+    }
 };
 
 /**
@@ -1184,7 +1213,7 @@ JitsiConference.prototype.onRemoteTrackAdded = function(track) {
         () => emitter.emit(JitsiConferenceEvents.TRACK_MUTE_CHANGED, track));
     track.addEventListener(
         JitsiTrackEvents.TRACK_AUDIO_LEVEL_CHANGED,
-        (tpc, audioLevel) => {
+        (audioLevel, tpc) => {
             const activeTPC = this.getActivePeerConnection();
 
             if (activeTPC === tpc) {
@@ -1235,8 +1264,6 @@ JitsiConference.prototype.onTransportInfo = function(session, transportInfo) {
  * @param {JitsiRemoteTrack} removedTrack
  */
 JitsiConference.prototype.onRemoteTrackRemoved = function(removedTrack) {
-    let consumed = false;
-
     this.getParticipants().forEach(participant => {
         const tracks = participant.getTracks();
 
@@ -1253,29 +1280,10 @@ JitsiConference.prototype.onRemoteTrackRemoved = function(removedTrack) {
                     this.transcriber.removeTrack(removedTrack);
                 }
 
-                consumed = true;
-
                 break;
             }
         }
     }, this);
-
-    if (!consumed) {
-        if ((this.isP2PActive() && !removedTrack.isP2P)
-             || (!this.isP2PActive() && removedTrack.isP2P)) {
-            // A remote track can be removed either as a result of
-            // 'source-remove' or the P2P logic which removes remote tracks
-            // explicitly when switching between JVB and P2P connections.
-            // The check above filters out the P2P logic case which should not
-            // result in an error (which just goes over all remote tracks).
-            return;
-        }
-        logger.error(
-            'Failed to match remote track on remove'
-                + ' with any of the participants',
-            removedTrack.getStreamId(),
-            removedTrack.getParticipantId());
-    }
 };
 
 /**
@@ -1346,13 +1354,21 @@ JitsiConference.prototype.onIncomingCall
         GlobalOnErrorHandler.callErrorHandler(error);
     }
 
-    this.rtc.initializeDataChannels(jingleSession.peerconnection);
-
     // Add local tracks to the session
     try {
         jingleSession.acceptOffer(
             jingleOffer,
-            null /* success */,
+            () => {
+                // If for any reason invite for the JVB session arrived after
+                // the P2P has been established already the media transfer needs
+                // to be turned off here.
+                if (this.isP2PActive() && this.jvbJingleSession) {
+                    this._suspendMediaTransferForJvbConnection();
+                }
+
+                // Open a channel with the videobridge.
+                this._setBridgeChannel();
+            },
             error => {
                 GlobalOnErrorHandler.callErrorHandler(error);
                 logger.error(
@@ -1373,6 +1389,37 @@ JitsiConference.prototype.onIncomingCall
     } catch (e) {
         GlobalOnErrorHandler.callErrorHandler(e);
         logger.error(e);
+    }
+};
+
+/**
+ * Sets the BridgeChannel.
+ */
+JitsiConference.prototype._setBridgeChannel = function() {
+    const jingleSession = this.jvbJingleSession;
+    const wsUrl = jingleSession.bridgeWebSocketUrl;
+    let bridgeChannelType;
+
+    switch (this.options.config.openBridgeChannel) {
+    case 'datachannel':
+    case true:
+    case undefined:
+        bridgeChannelType = 'datachannel';
+        break;
+    case 'websocket':
+        bridgeChannelType = 'websocket';
+        break;
+    }
+
+    if (bridgeChannelType === 'datachannel'
+        && !RTCBrowserType.supportsDataChannels()) {
+        bridgeChannelType = 'websocket';
+    }
+
+    if (bridgeChannelType === 'datachannel') {
+        this.rtc.initializeBridgeChannel(jingleSession.peerconnection, null);
+    } else if (bridgeChannelType === 'websocket' && wsUrl) {
+        this.rtc.initializeBridgeChannel(null, wsUrl);
     }
 };
 
@@ -1414,13 +1461,15 @@ JitsiConference.prototype._rejectIncomingCall
 
     // Terminate  the jingle session with a reason
     jingleSession.terminate(
-        options && options.reasonTag,
-        options && options.reasonMsg,
         null /* success callback => we don't care */,
         error => {
             logger.warn(
                 'An error occurred while trying to terminate'
                     + ' invalid Jingle session', error);
+        }, {
+            reason: options.reasonTag,
+            reasonDescription: options.reasonMsg,
+            sendSessionTerminate: true
         });
 };
 
@@ -1458,6 +1507,18 @@ JitsiConference.prototype.onCallEnded
         // Let the RTC service do any cleanups
         this.rtc.onCallEnded();
     } else if (jingleSession === this.p2pJingleSession) {
+        // It's the responder who decides to enforce JVB mode, so that both
+        // initiator and responder are aware if it was intentional.
+        if (reasonCondition === 'decline' && reasonText === 'force JVB121') {
+            logger.info('In forced JVB 121 mode...');
+            Statistics.analytics.addPermanentProperties({ forceJvb121: true });
+        } else if (reasonCondition === 'connectivity-error'
+            && reasonText === 'ICE FAILED') {
+            // It can happen that the other peer detects ICE failed and
+            // terminates the session, before we get the event on our side.
+            // But we are able to parse the reason and mark it here.
+            Statistics.analytics.addPermanentProperties({ p2pFailed: true });
+        }
         this._stopP2PSession();
     } else {
         logger.error(
@@ -1855,7 +1916,7 @@ JitsiConference.prototype._fireIncompatibleVersionsEvent = function() {
  * @throws NetworkError or InvalidStateError or Error if the operation fails.
  */
 JitsiConference.prototype.sendEndpointMessage = function(to, payload) {
-    this.rtc.sendDataChannelMessage(to, payload);
+    this.rtc.sendChannelMessage(to, payload);
 };
 
 /**
@@ -1897,6 +1958,11 @@ JitsiConference.prototype._onIceConnectionFailed = function(session) {
     // We do nothing for the JVB connection, because it's up to the Jicofo to
     // eventually come up with the new offer (at least for the time being).
     if (session.isP2P) {
+        // Add p2pFailed property to analytics to distinguish, between "good"
+        // and "bad" connection
+        Statistics.analytics.addPermanentProperties({ p2pFailed: true });
+
+        // Log analytics event, but only for the initiator to not count it twice
         if (this.p2pJingleSession && this.p2pJingleSession.isInitiator) {
             Statistics.sendEventToAll('p2p.failed');
         }
@@ -1929,8 +1995,6 @@ JitsiConference.prototype._onIceConnectionRestored = function(session) {
  */
 JitsiConference.prototype._acceptP2PIncomingCall
 = function(jingleSession, jingleOffer) {
-    jingleSession.setSSRCOwnerJid(this.room.myroomjid);
-
     this.isP2PConnectionInterrupted = false;
 
     // Accept the offer
@@ -1999,11 +2063,25 @@ JitsiConference.prototype._addRemoteTracks = function(logName, remoteTracks) {
  */
 JitsiConference.prototype._onIceConnectionEstablished
 = function(jingleSession) {
+    const forceJVB121Ratio = this.options.config.forceJVB121Ratio;
+
     // We don't care about the JVB case, there's nothing to be done
     if (!jingleSession.isP2P) {
         return;
     } else if (this.p2pJingleSession !== jingleSession) {
         logger.error('CONNECTION_ESTABLISHED - wrong P2P session instance ?!');
+
+        return;
+    } else if (!jingleSession.isInitiator
+        && typeof forceJVB121Ratio === 'number'
+        && Math.random() < forceJVB121Ratio) {
+        logger.info(`Forcing JVB 121 mode (ratio=${forceJVB121Ratio})...`);
+        this._rejectIncomingCall(
+            jingleSession, {
+                reasonTag: 'decline',
+                reasonMsg: 'force JVB121'
+            });
+        Statistics.analytics.addPermanentProperties({ forceJvb121: true });
 
         return;
     }
@@ -2089,7 +2167,7 @@ JitsiConference.prototype._removeRemoteTracks
  */
 JitsiConference.prototype._resumeMediaTransferForJvbConnection = function() {
     logger.info('Resuming media transfer over the JVB connection...');
-    this.jvbJingleSession.setMediaTransferActive(true).then(
+    this.jvbJingleSession.setMediaTransferActive(true, true).then(
         () => {
             logger.info('Resumed media transfer over the JVB connection!');
         },
@@ -2116,6 +2194,25 @@ JitsiConference.prototype._setP2PStatus = function(newStatus) {
     this.p2p = newStatus;
     if (newStatus) {
         logger.info('Peer to peer connection established!');
+
+        // When we end up in a valid P2P session need to reset the properties
+        // in case they have persisted, after session with another peer.
+        Statistics.analytics.addPermanentProperties({
+            p2pFailed: false,
+            forceJvb121: false
+        });
+
+        // Sync up video transfer active in case p2pJingleSession not existed
+        // when the lastN value was being adjusted.
+        const isVideoActive = this.rtc.getLastN() !== 0;
+
+        this.p2pJingleSession
+            .setMediaTransferActive(true, isVideoActive)
+            .catch(error => {
+                logger.error(
+                    'Failed to sync up P2P video transfer status'
+                        + `(${isVideoActive})`, error);
+            });
     } else {
         logger.info('Peer to peer connection closed!');
     }
@@ -2160,8 +2257,6 @@ JitsiConference.prototype._startP2PSession = function(peerJid) {
         = this.xmpp.connection.jingle.newP2PJingleSession(
                 this.room.myroomjid,
                 peerJid);
-    this.p2pJingleSession.setSSRCOwnerJid(this.room.myroomjid);
-
     logger.info('Created new P2P JingleSession', this.room.myroomjid, peerJid);
 
     this.p2pJingleSession.initialize(true /* initiator */, this.room, this.rtc);
@@ -2185,7 +2280,7 @@ JitsiConference.prototype._startP2PSession = function(peerJid) {
  */
 JitsiConference.prototype._suspendMediaTransferForJvbConnection = function() {
     logger.info('Suspending media transfer over the JVB connection...');
-    this.jvbJingleSession.setMediaTransferActive(false).then(
+    this.jvbJingleSession.setMediaTransferActive(false, false).then(
         () => {
             logger.info('Suspended media transfer over the JVB connection !');
         },
@@ -2204,7 +2299,11 @@ JitsiConference.prototype._suspendMediaTransferForJvbConnection = function() {
  * @private
  */
 JitsiConference.prototype._maybeStartOrStopP2P = function(userLeftEvent) {
-    if (!this.options.config.enableP2P || !RTCBrowserType.isP2PSupported()) {
+    if (!(RTCBrowserType.isP2PSupported()
+            && ((this.options.config.p2p && this.options.config.p2p.enabled)
+
+            // FIXME: remove once we have a default config template. -saghul
+            || typeof this.options.config.p2p === 'undefined'))) {
         logger.info('Auto P2P disabled');
 
         return;
@@ -2264,7 +2363,7 @@ JitsiConference.prototype._maybeStartOrStopP2P = function(userLeftEvent) {
             logger.info(`Will start P2P with: ${jid}`);
             this._startP2PSession(jid);
         }
-    } else if (isModerator && this.p2pJingleSession && !shouldBeInP2P) {
+    } else if (this.p2pJingleSession && !shouldBeInP2P) {
         logger.info(`Will stop P2P with: ${this.p2pJingleSession.peerjid}`);
 
         // Log that there will be a switch back to the JVB connection
@@ -2295,7 +2394,9 @@ JitsiConference.prototype._stopP2PSession
 
     // Swap remote tracks, but only if the P2P has been fully established
     if (wasP2PEstablished) {
-        this._resumeMediaTransferForJvbConnection();
+        if (this.jvbJingleSession) {
+            this._resumeMediaTransferForJvbConnection();
+        }
 
         // Remove remote P2P tracks
         this._removeRemoteP2PTracks();
@@ -2305,23 +2406,39 @@ JitsiConference.prototype._stopP2PSession
     logger.info('Stopping remote stats for P2P connection');
     this.statistics.stopRemoteStats(this.p2pJingleSession.peerconnection);
     logger.info('Stopping CallStats for P2P connection');
-    this.statistics.stopCallStats(
-        this.p2pJingleSession.peerconnection);
+    this.statistics.stopCallStats(this.p2pJingleSession.peerconnection);
 
-    if (JingleSessionState.ENDED !== this.p2pJingleSession.state) {
-        this.p2pJingleSession.terminate(
-            reason ? reason : 'success',
-            reasonDescription
-                ? reasonDescription : 'Turing off P2P session',
-            () => {
-                logger.info('P2P session terminate RESULT');
-            },
-            error => {
-                logger.warn(
+    this.p2pJingleSession.terminate(
+        () => {
+            logger.info('P2P session terminate RESULT');
+        },
+        error => {
+            // Because both initiator and responder are simultaneously
+            // terminating their JingleSessions in case of the 'to JVB switch'
+            // when 3rd participant joins, both will dispose their sessions and
+            // reply with 'item-not-found' (see strophe.jingle.js). We don't
+            // want to log this as an error since it's expected behaviour.
+            //
+            // We want them both to terminate, because in case of initiator's
+            // crash the responder would stay in P2P mode until ICE fails which
+            // could take up to 20 seconds.
+            //
+            // NOTE lack of 'reason' is considered as graceful session terminate
+            // where both initiator and responder terminate their sessions
+            // simultaneously.
+            if (reason) {
+                logger.error(
                     'An error occurred while trying to terminate'
-                    + ' P2P Jingle session', error);
-            });
-    }
+                        + ' P2P Jingle session', error);
+            }
+        }, {
+            reason: reason ? reason : 'success',
+            reasonDescription: reasonDescription
+                ? reasonDescription : 'Turing off P2P session',
+            sendSessionTerminate: this.room
+                && this.getParticipantById(
+                    Strophe.getResourceFromJid(this.p2pJingleSession.peerjid))
+        });
 
     this.p2pJingleSession = null;
 

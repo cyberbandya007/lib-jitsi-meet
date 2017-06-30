@@ -60,13 +60,23 @@ export default function TraceablePeerConnection(
 
     /**
      * Indicates whether or not this peer connection instance is actively
-     * sending/receiving media. When set to <tt>false</tt> the SDP media
-     * direction will be adjusted to 'inactive' in order to suspend media
-     * transmission.
+     * sending/receiving audio media. When set to <tt>false</tt> the SDP audio
+     * media direction will be adjusted to 'inactive' in order to suspend
+     * the transmission.
      * @type {boolean}
      * @private
      */
-    this.mediaTransferActive = true;
+    this.audioTransferActive = true;
+
+    /**
+     * Indicates whether or not this peer connection instance is actively
+     * sending/receiving video media. When set to <tt>false</tt> the SDP video
+     * media direction will be adjusted to 'inactive' in order to suspend
+     * the transmission.
+     * @type {boolean}
+     * @private
+     */
+    this.videoTransferActive = true;
 
     /**
      * The parent instance of RTC service which created this
@@ -319,7 +329,7 @@ TraceablePeerConnection.prototype.getConnectionState = function() {
 /**
  * Obtains the media direction for given {@link MediaType}. The method takes
  * into account whether or not there are any local tracks for media and
- * the {@link mediaTransferActive} flag.
+ * the {@link audioTransferActive} and {@link videoTransferActive} flags.
  * @param {MediaType} mediaType
  * @return {string} one of the SDP direction constants ('sendrecv, 'recvonly'
  * etc.) which should be used when setting local description on the peer
@@ -328,7 +338,14 @@ TraceablePeerConnection.prototype.getConnectionState = function() {
  */
 TraceablePeerConnection.prototype._getDesiredMediaDirection
 = function(mediaType) {
-    if (this.mediaTransferActive) {
+    let mediaTransferActive = true;
+
+    if (mediaType === MediaType.AUDIO) {
+        mediaTransferActive = this.audioTransferActive;
+    } else if (mediaType === MediaType.VIDEO) {
+        mediaTransferActive = this.videoTransferActive;
+    }
+    if (mediaTransferActive) {
         return this.hasAnyTracksOfType(mediaType) ? 'sendrecv' : 'recvonly';
     }
 
@@ -500,12 +517,12 @@ TraceablePeerConnection.prototype._remoteStreamAdded = function(stream) {
 
     // Bind 'addtrack'/'removetrack' event handlers
     if (RTCBrowserType.isChrome() || RTCBrowserType.isNWJS()
-        || RTCBrowserType.isElectron()) {
+        || RTCBrowserType.isElectron() || RTCBrowserType.isEdge()) {
         stream.onaddtrack = event => {
-            this._remoteTrackAdded(event.target, event.track);
+            this._remoteTrackAdded(stream, event.track);
         };
         stream.onremovetrack = event => {
-            this._remoteTrackRemoved(event.target, event.track);
+            this._remoteTrackRemoved(stream, event.track);
         };
     }
 
@@ -666,8 +683,7 @@ TraceablePeerConnection.prototype._createRemoteTrack
     }
     remoteTracksMap.set(mediaType, remoteTrack);
 
-    // FIXME not cool to use RTC's eventEmitter
-    this.rtc.eventEmitter.emit(RTCEvents.REMOTE_TRACK_ADDED, remoteTrack);
+    this.eventEmitter.emit(RTCEvents.REMOTE_TRACK_ADDED, remoteTrack);
 };
 
 /* eslint-enable max-params */
@@ -710,7 +726,7 @@ TraceablePeerConnection.prototype._remoteStreamRemoved = function(stream) {
 TraceablePeerConnection.prototype._remoteTrackRemoved
 = function(stream, track) {
     const streamId = RTC.getStreamID(stream);
-    const trackId = track && track.id;
+    const trackId = track && RTC.getTrackID(track);
 
     logger.info(`${this} - remote track removed: ${streamId}, ${trackId}`);
 
@@ -728,7 +744,7 @@ TraceablePeerConnection.prototype._remoteTrackRemoved
         return;
     }
 
-    if (!this._removeRemoteTrack(streamId, trackId)) {
+    if (!this._removeRemoteTrackById(streamId, trackId)) {
         // NOTE this warning is always printed when user leaves the room,
         // because we remove remote tracks manually on MUC member left event,
         // before the SSRCs are removed by Jicofo. In most cases it is fine to
@@ -801,6 +817,26 @@ TraceablePeerConnection.prototype.removeRemoteTracks = function(owner) {
 };
 
 /**
+ * Removes and disposes given <tt>JitsiRemoteTrack</tt> instance. Emits
+ * {@link RTCEvents.REMOTE_TRACK_REMOVED}.
+ * @param {JitsiRemoteTrack} toBeRemoved
+ */
+TraceablePeerConnection.prototype._removeRemoteTrack = function(toBeRemoved) {
+    toBeRemoved.dispose();
+    const participantId = toBeRemoved.getParticipantId();
+    const remoteTracksMap = this.remoteTracks.get(participantId);
+
+    if (!remoteTracksMap) {
+        logger.error(
+            `removeRemoteTrack: no remote tracks map for ${participantId}`);
+    } else if (!remoteTracksMap.delete(toBeRemoved.getType())) {
+        logger.error(
+            `Failed to remove ${toBeRemoved} - type mapping messed up ?`);
+    }
+    this.eventEmitter.emit(RTCEvents.REMOTE_TRACK_REMOVED, toBeRemoved);
+};
+
+/**
  * Removes and disposes <tt>JitsiRemoteTrack</tt> identified by given stream and
  * track ids.
  *
@@ -810,26 +846,12 @@ TraceablePeerConnection.prototype.removeRemoteTracks = function(owner) {
  * <tt>undefined</tt> if no track matching given stream and track ids was
  * found.
  */
-TraceablePeerConnection.prototype._removeRemoteTrack
+TraceablePeerConnection.prototype._removeRemoteTrackById
 = function(streamId, trackId) {
     const toBeRemoved = this._getRemoteTrackById(streamId, trackId);
 
     if (toBeRemoved) {
-        toBeRemoved.dispose();
-
-        const remoteTracksMap
-            = this.remoteTracks.get(toBeRemoved.getParticipantId());
-
-        // If _getRemoteTrackById succeeded it must be a valid value or
-        // we're good to crash
-        if (!remoteTracksMap.delete(toBeRemoved.getType())) {
-            logger.error(
-                `Failed to remove ${toBeRemoved} - type mapping messed up ?`);
-        }
-
-        // FIXME not cool to use RTC's eventEmitter
-        this.rtc.eventEmitter.emit(
-            RTCEvents.REMOTE_TRACK_REMOVED, toBeRemoved);
+        this._removeRemoteTrack(toBeRemoved);
     }
 
     return toBeRemoved;
@@ -1013,6 +1035,33 @@ const normalizePlanB = function(desc) {
 };
 
 /**
+ * Makes sure that both audio and video directions are configured as 'sendrecv'.
+ * @param {Object} localDescription the SDP object as defined by WebRTC.
+ */
+const enforceSendRecv = function(localDescription) {
+    if (localDescription && localDescription.sdp) {
+        const transformer = new SdpTransformWrap(localDescription.sdp);
+        const audioMedia = transformer.selectMedia('audio');
+        let changed = false;
+
+        if (audioMedia && audioMedia.direction !== 'sendrecv') {
+            audioMedia.direction = 'sendrecv';
+            changed = true;
+        }
+        const videoMedia = transformer.selectMedia('video');
+
+        if (videoMedia && videoMedia.direction !== 'sendrecv') {
+            videoMedia.direction = 'sendrecv';
+            changed = true;
+        }
+
+        if (changed) {
+            localDescription.sdp = transformer.toRawSDP();
+        }
+    }
+};
+
+/**
  *
  * @param {JitsiLocalTrack} localTrack
  */
@@ -1047,6 +1096,16 @@ const getters = {
             logger.debug(
                 'getLocalDescription::postTransform (munge local SDP)', desc);
         }
+
+        // What comes out of this getter will be signalled over Jingle to
+        // the other peer, so we need to make sure the media direction is
+        // 'sendrecv' because we won't change the direction later and don't want
+        // the other peer to think we can't send or receive.
+        //
+        // Note that the description we set in chrome does have the accurate
+        // direction (e.g. 'recvonly'), since that is technically what is
+        // happening (check setLocalDescription impl).
+        enforceSendRecv(desc);
 
         return desc || {};
     },
@@ -1364,7 +1423,8 @@ TraceablePeerConnection.prototype._ensureSimulcastGroupIsLast
 
 /**
  * Will adjust audio and video media direction in the given SDP object to
- * reflect the current status of the {@link mediaTransferActive} flag.
+ * reflect the current status of the {@link audioTransferActive} and
+ * {@link videoTransferActive} flags.
  * @param {Object} localDescription the WebRTC session description instance for
  * the local description.
  * @private
@@ -1435,7 +1495,7 @@ TraceablePeerConnection.prototype.setLocalDescription
 
             if (localUfrag !== this.localUfrag) {
                 this.localUfrag = localUfrag;
-                this.rtc.eventEmitter.emit(
+                this.eventEmitter.emit(
                     RTCEvents.LOCAL_UFRAG_CHANGED, this, localUfrag);
             }
             successCallback();
@@ -1451,16 +1511,25 @@ TraceablePeerConnection.prototype.setLocalDescription
 };
 
 /**
- * Enables/disables media transmission on this peer connection. When disabled
- * the SDP media direction in the local SDP will be adjusted to 'inactive' which
- * means that no data will be received or sent, but the connection should be
- * kept alive.
- * @param {boolean} active <tt>true</tt> to enable the media transmission or
- * <tt>false</tt> to disable.
+ * Enables/disables audio media transmission on this peer connection. When
+ * disabled the SDP audio media direction in the local SDP will be adjusted to
+ * 'inactive' which means that no data will be sent nor accepted, but
+ * the connection should be kept alive.
+ * @param {boolean} active <tt>true</tt> to enable video media transmission or
+ * <tt>false</tt> to disable. If the value is not a boolean the call will have
+ * no effect.
+ * @return {boolean} <tt>true</tt> if the value has changed and sRD/sLD cycle
+ * needs to be executed in order for the changes to take effect or
+ * <tt>false</tt> if the given value was the same as the previous one.
  * @public
  */
-TraceablePeerConnection.prototype.setMediaTransferActive = function(active) {
-    this.mediaTransferActive = active;
+TraceablePeerConnection.prototype.setAudioTransferActive = function(active) {
+    logger.debug(`${this} audio transfer active: ${active}`);
+    const changed = this.audioTransferActive !== active;
+
+    this.audioTransferActive = active;
+
+    return changed;
 };
 
 TraceablePeerConnection.prototype.setRemoteDescription
@@ -1508,7 +1577,7 @@ TraceablePeerConnection.prototype.setRemoteDescription
 
             if (remoteUfrag !== this.remoteUfrag) {
                 this.remoteUfrag = remoteUfrag;
-                this.rtc.eventEmitter.emit(
+                this.eventEmitter.emit(
                     RTCEvents.REMOTE_UFRAG_CHANGED, this, remoteUfrag);
             }
             successCallback();
@@ -1521,6 +1590,28 @@ TraceablePeerConnection.prototype.setRemoteDescription
                 this);
             failureCallback(err);
         });
+};
+
+/**
+ * Enables/disables video media transmission on this peer connection. When
+ * disabled the SDP video media direction in the local SDP will be adjusted to
+ * 'inactive' which means that no data will be sent nor accepted, but
+ * the connection should be kept alive.
+ * @param {boolean} active <tt>true</tt> to enable video media transmission or
+ * <tt>false</tt> to disable. If the value is not a boolean the call will have
+ * no effect.
+ * @return {boolean} <tt>true</tt> if the value has changed and sRD/sLD cycle
+ * needs to be executed in order for the changes to take effect or
+ * <tt>false</tt> if the given value was the same as the previous one.
+ * @public
+ */
+TraceablePeerConnection.prototype.setVideoTransferActive = function(active) {
+    logger.debug(`${this} video transfer active: ${active}`);
+    const changed = this.videoTransferActive !== active;
+
+    this.videoTransferActive = active;
+
+    return changed;
 };
 
 /**
@@ -1543,6 +1634,11 @@ TraceablePeerConnection.prototype.clearRecvonlySsrc = function() {
     this.sdpConsistency.clearVideoSsrcCache();
 };
 
+/**
+ * Closes underlying WebRTC PeerConnection instance and removes all remote
+ * tracks by emitting {@link RTCEvents.REMOTE_TRACK_REMOVED} for each one of
+ * them.
+ */
 TraceablePeerConnection.prototype.close = function() {
     this.trace('stop');
 
@@ -1552,6 +1648,13 @@ TraceablePeerConnection.prototype.close = function() {
     this.signalingLayer.off(
         SignalingEvents.PEER_VIDEO_TYPE_CHANGED, this._peerVideoTypeChanged);
 
+    for (const peerTracks of this.remoteTracks.values()) {
+        for (const remoteTrack of peerTracks.values()) {
+            this._removeRemoteTrack(remoteTrack);
+        }
+    }
+    this.remoteTracks.clear();
+
     if (!this.rtc._removePeerConnection(this)) {
         logger.error('RTC._removePeerConnection returned false');
     }
@@ -1559,6 +1662,7 @@ TraceablePeerConnection.prototype.close = function() {
         window.clearInterval(this.statsinterval);
         this.statsinterval = null;
     }
+    logger.info(`Closing ${this}...`);
     this.peerconnection.close();
 };
 
@@ -1838,6 +1942,7 @@ TraceablePeerConnection.prototype.getStats = function(callback, errback) {
             null,
             callback,
             errback || (() => {
+
                 // Making sure that getStats won't fail if error callback is
                 // not passed.
             }));

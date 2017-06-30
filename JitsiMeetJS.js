@@ -33,7 +33,7 @@ const logger = Logger.getLogger(__filename);
 
 // The amount of time to wait until firing
 // JitsiMediaDevicesEvents.PERMISSION_PROMPT_IS_SHOWN event
-const USER_MEDIA_PERMISSION_PROMPT_TIMEOUT = 500;
+const USER_MEDIA_PERMISSION_PROMPT_TIMEOUT = 1000;
 
 /**
  *
@@ -275,8 +275,7 @@ export default {
 
                         if (track.getType() === MediaType.AUDIO) {
                             Statistics.startLocalStats(mStream,
-                                track.setAudioLevel.bind(
-                                    track, null /* no TPC */));
+                                track.setAudioLevel.bind(track));
                             track.addEventListener(
                                 JitsiTrackEvents.LOCAL_TRACK_STOPPED,
                                 () => {
@@ -305,7 +304,7 @@ export default {
                 promiseFulfilled = true;
 
                 if (error.name === JitsiTrackErrors.UNSUPPORTED_RESOLUTION) {
-                    const oldResolution = options.resolution || '360';
+                    const oldResolution = options.resolution || '720';
                     const newResolution = getLowerResolution(oldResolution);
 
                     if (newResolution !== null) {
